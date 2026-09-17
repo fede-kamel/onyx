@@ -25,6 +25,12 @@ from onyx.utils.logger import setup_logger
 logger = setup_logger()
 
 
+def escape_odata_string(name: str) -> str:
+    """An OData string literal doubles its apostrophes. Other characters that
+    break Graph's OData parser are handled by filtering on the client instead."""
+    return name.replace("'", "''")
+
+
 def execute_query_with_retry(
     query: ClientQuery,
     method_name: str,
@@ -91,7 +97,8 @@ def request_with_retry(
     request_url: str,
     accept: str | None = None,
 ) -> requests.Response:
-    """One Graph request under Teams' retry policy, whatever it returns."""
+    """One Graph request under Teams' retry policy, as a raw response rather
+    than parsed JSON."""
     MAX_RETRIES = 10
     retry_number = 0
 
