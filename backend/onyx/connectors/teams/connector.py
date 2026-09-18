@@ -34,6 +34,7 @@ from onyx.connectors.interfaces import (
     CheckpointOutput,
     GenerateSlimDocumentOutput,
     SecondsSinceUnixEpoch,
+    SlimConnector,
     SlimConnectorWithPermSync,
 )
 from onyx.connectors.microsoft_utils.drive_items import (
@@ -122,6 +123,7 @@ class TeamsCheckpoint(ConnectorCheckpoint):
 
 class TeamsConnector(
     CheckpointedConnectorWithPermSync[TeamsCheckpoint],
+    SlimConnector,
     SlimConnectorWithPermSync,
 ):
     MAX_WORKERS = 10
@@ -175,7 +177,13 @@ class TeamsConnector(
             directory_id=credentials["teams_directory_id"],
             authority_host=self.authority_host,
             auth_method=self._auth_method,
-            client_secret=credentials.get("teams_client_secret"),
+            # A client-secret credential must carry its secret. The certificate
+            # method carries a key instead, so neither key is always present.
+            client_secret=(
+                credentials["teams_client_secret"]
+                if self._auth_method is MicrosoftAuthMethod.CLIENT_SECRET
+                else credentials.get("teams_client_secret")
+            ),
             private_key_b64=credentials.get(CREDENTIAL_PRIVATE_KEY),
             certificate_password=credentials.get(CREDENTIAL_CERTIFICATE_PASSWORD),
         ).app
@@ -315,8 +323,9 @@ class TeamsConnector(
         except requests.HTTPError as e:
             if _status(e) in (401, 403):
                 raise InsufficientPermissionsError(
-                    "Include Attachments needs the Sites.Read.All application "
-                    "permission for the channel sites, on Graph and on SharePoint "
+                    "Include Attachments needs read access to the channel sites on "
+                    "Graph and on SharePoint, through Sites.Read.All or a "
+                    "Sites.Selected grant on each channel site "
                     f"({_status(e)} on a channel's files)."
                 )
             raise UnexpectedValidationError(
@@ -585,11 +594,29 @@ class TeamsConnector(
 
     # impls for SlimConnectorWithPermSync
 
+    def retrieve_all_slim_docs(
+        self,
+        start: SecondsSinceUnixEpoch | None = None,
+        end: SecondsSinceUnixEpoch | None = None,  # noqa: ARG002
+        callback: IndexingHeartbeatInterface | None = None,
+    ) -> GenerateSlimDocumentOutput:
+        """Ids alone, for pruning. Readers cost a members call per channel and a
+        SharePoint call per file, and pruning throws them away."""
+        yield from self._slim_docs(start, callback, with_readers=False)
+
     def retrieve_all_slim_docs_perm_sync(
         self,
         start: SecondsSinceUnixEpoch | None = None,
         end: SecondsSinceUnixEpoch | None = None,  # noqa: ARG002
         callback: IndexingHeartbeatInterface | None = None,
+    ) -> GenerateSlimDocumentOutput:
+        yield from self._slim_docs(start, callback, with_readers=True)
+
+    def _slim_docs(
+        self,
+        start: SecondsSinceUnixEpoch | None,
+        callback: IndexingHeartbeatInterface | None,
+        with_readers: bool,
     ) -> GenerateSlimDocumentOutput:
         start = start or 0
 
@@ -618,14 +645,16 @@ class TeamsConnector(
                     continue
 
                 ref = _channel_ref(team.id, channel)
-                # A refused members call raises: a listing without its readers
-                # would let pruning and permission sync act on a partial picture.
-                with _channel_context(ref, "members"):
-                    _, external_access = fetch_channel_readers(
-                        graph_client=self.graph_client,  # ty: ignore[invalid-argument-type]
-                        team_id=ref.team_id,
-                        channel_id=ref.id,
-                    )
+                external_access = None
+                if with_readers:
+                    # A refused members call raises: a listing without its
+                    # readers would let permission sync act on a partial picture.
+                    with _channel_context(ref, "members"):
+                        _, external_access = fetch_channel_readers(
+                            graph_client=self.graph_client,  # ty: ignore[invalid-argument-type]
+                            team_id=ref.team_id,
+                            channel_id=ref.id,
+                        )
 
                 messages = fetch_messages(
                     graph_client=self.graph_client,  # ty: ignore[invalid-argument-type]
@@ -648,8 +677,7 @@ class TeamsConnector(
                 )
                 if self.include_attachments:
                     slim_docs = chain(
-                        slim_docs,
-                        self._slim_channel_files(_channel_ref(team.id, channel)),
+                        slim_docs, self._slim_channel_files(ref, with_readers)
                     )
 
                 slim_doc_buffer: list[SlimDocument | HierarchyNode] = []
@@ -669,17 +697,21 @@ class TeamsConnector(
                 if slim_doc_buffer:
                     yield slim_doc_buffer
 
-    def _slim_channel_files(self, channel: ChannelRef) -> Iterator[SlimDocument]:
-        """Channel files with the readers SharePoint grants them, so pruning and
-        permission sync use the same ids and readers the indexing walk writes.
-        A refused folder or site raises, as a refused members call does: a
-        channel missing from this listing would have its documents pruned."""
+    def _slim_channel_files(
+        self, channel: ChannelRef, with_readers: bool
+    ) -> Iterator[SlimDocument]:
+        """Channel files with the ids the indexing walk writes, and with the
+        readers SharePoint grants them when the caller needs those. A refused
+        folder or site raises, as a refused members call does: a channel missing
+        from this listing would have its documents pruned."""
         with _channel_context(channel, "files"):
             library = self._channel_library(channel)
             for item in self._channel_files(library, start=None):
                 yield SlimDocument(
                     id=file_document_id(item.id),
-                    external_access=self._file_access(library, item),
+                    external_access=(
+                        self._file_access(library, item) if with_readers else None
+                    ),
                     doc_created_at=item.created_datetime,
                 )
 

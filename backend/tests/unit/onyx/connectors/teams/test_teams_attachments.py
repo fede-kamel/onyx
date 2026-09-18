@@ -341,6 +341,34 @@ def test_the_slim_walk_lists_files_with_their_own_readers(
     assert library["listed"] == [(DRIVE, FOLDER_ID, None)]
 
 
+def test_the_pruning_walk_lists_the_same_ids_without_reading_readers(
+    library: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library["files"] = [_item("item-1", "Plan.pdf")]
+    team, sdk_channel = _sdk_team_and_channel()
+    monkeypatch.setattr(connector_module, "_collect_all_teams", lambda **_: [team])
+    monkeypatch.setattr(
+        connector_module, "_collect_all_channels_from_team", lambda **_: [sdk_channel]
+    )
+    routes = {**MEMBERS, **LIBRARY_ROUTES, DELTA_URL: {"value": [message("m1", "P")]}}
+    client = graph_client(routes)
+
+    slim = [
+        (doc.id, doc.external_access)
+        for batch in connector(
+            client, include_attachments=True
+        ).retrieve_all_slim_docs()
+        for doc in batch
+        if isinstance(doc, SlimDocument)
+    ]
+
+    assert slim == [("m1", None), (file_document_id("item-1"), None)]
+    # Neither the members call nor the SharePoint readers lookup is worth making
+    # for a walk that only decides what no longer exists.
+    assert MEMBERS_URL not in _requested(client)
+    assert library["access"] == []
+
+
 @pytest.mark.usefixtures("library")
 def test_the_rest_context_is_reused_per_site_until_its_token_ages(
     monkeypatch: pytest.MonkeyPatch,
@@ -458,6 +486,21 @@ def test_the_certificate_credential_is_parsed_and_passed_to_msal(
     assert built["certificate_password"] == "pw"
     assert built["client_secret"] is None
     assert teams_connector._auth_method is MicrosoftAuthMethod.CERTIFICATE
+
+
+def test_a_client_secret_credential_without_its_secret_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(connector_module, "build_msal_app", MagicMock())
+
+    with pytest.raises(KeyError, match="teams_client_secret"):
+        TeamsConnector().load_credentials(
+            {
+                "authentication_method": "client_secret",
+                "teams_client_id": "app",
+                "teams_directory_id": "tenant",
+            }
+        )
 
 
 def _validation_connector(
